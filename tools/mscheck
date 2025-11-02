@@ -1,0 +1,179 @@
+#!/bin/bash
+# ============================================================
+# mscheck - 文件哈希对比工具 (兼容 macOS Bash 3.2)
+# ============================================================
+
+TYPE="md5"
+SHA_ALGO="sha1"
+COMPARE_TYPE=""
+COMPARE_VAL=""
+FILES=()
+
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+RESET='\033[0m'
+
+# 参数解析
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -type=*)
+      TYPE="${1#*=}" ;;
+    --a)
+      shift
+      case "$1" in
+        224|256|384|512) SHA_ALGO="sha$1" ;;
+        *) echo -e "${RED}错误：仅支持 --a 224/256/384/512${RESET}"; exit 1 ;;
+      esac ;;
+    -md5=*)
+      COMPARE_TYPE="md5"; COMPARE_VAL="${1#*=}" ;;
+    -sha=*)
+      COMPARE_TYPE="sha"; COMPARE_VAL="${1#*=}" ;;
+    -*)
+      echo -e "${RED}未知参数: $1${RESET}"; exit 1 ;;
+    *)
+      FILES+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo -e "${YELLOW}用法:${RESET} mscheck file1 [file2 ...] [-type=md5|sha|all] [--a 256] [-md5=xxx|-sha=xxx]"
+  exit 1
+fi
+
+# 命令检测
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+calc_md5() {
+  local f="$1"
+  if cmd_exists md5; then
+    md5 -q "$f"
+  elif cmd_exists md5sum; then
+    md5sum "$f" | awk '{print $1}'
+  elif cmd_exists openssl; then
+    openssl md5 "$f" | awk -F'= ' '{print $NF}' | tr -d ' '
+  else
+    echo -e "${RED}错误：未找到可用的 MD5 命令${RESET}" >&2
+    exit 1
+  fi
+}
+
+calc_sha() {
+  local f="$1"
+  local algo="$2"
+  if cmd_exists "$algo"; then
+    "$algo" "$f" | awk '{print $NF}'
+    return
+  fi
+  if cmd_exists shasum; then
+    local bits="${algo#sha}"
+    [[ "$bits" == "1" ]] && bits=1
+    shasum -a "$bits" "$f" | awk '{print $1}'
+    return
+  fi
+  if cmd_exists openssl; then
+    local bits="${algo#sha}"
+    openssl dgst "-sha${bits}" "$f" | awk -F'= ' '{print $NF}' | tr -d ' '
+    return
+  fi
+  echo -e "${RED}错误: 未找到可用的 SHA 命令 ($algo)${RESET}" >&2
+  exit 1
+}
+
+# 主逻辑（使用两个平行数组）
+NAMES=()
+HASHES=()
+
+for f in "${FILES[@]}"; do
+  [[ ! -f "$f" ]] && echo -e "${RED}错误: 文件不存在 - $f${RESET}" && exit 1
+
+  if [[ "$TYPE" == "md5" ]]; then
+    hash=$(calc_md5 "$f")
+  elif [[ "$TYPE" == "sha" ]]; then
+    hash=$(calc_sha "$f" "$SHA_ALGO")
+  elif [[ "$TYPE" == "all" ]]; then
+    md5v=$(calc_md5 "$f")
+    shav=$(calc_sha "$f" "sha1")
+    echo -e "${CYAN}$f${RESET}, md5=${GREEN}$md5v${RESET}, sha=${GREEN}$shav${RESET}"
+    continue
+  else
+    echo -e "${RED}错误: -type 仅支持 md5 / sha / all${RESET}"
+    exit 1
+  fi
+
+  NAMES+=("$f")
+  HASHES+=("$hash")
+done
+
+# ✅ 关键：如果用户选择的是 “all”，直接退出
+if [[ "$TYPE" == "all" ]]; then
+  exit 0
+fi
+
+
+# 辅助函数：小写转换（兼容旧 bash）
+to_lower() {
+  echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# 哈希名显示
+HASH_NAME="$TYPE"
+if [[ "$TYPE" == "sha" ]]; then
+  case "$SHA_ALGO" in
+    sha1)   HASH_NAME="sha" ;;
+    sha224) HASH_NAME="sha(224)" ;;
+    sha256) HASH_NAME="sha(256)" ;;
+    sha384) HASH_NAME="sha(384)" ;;
+    sha512) HASH_NAME="sha(512)" ;;
+  esac
+fi
+
+# 单文件 + 对比
+if [[ ${#NAMES[@]} -eq 1 && -n "$COMPARE_VAL" ]]; then
+  val=$(to_lower "${HASHES[0]}")
+  cmp=$(to_lower "$COMPARE_VAL")
+  if [[ "$val" == "$cmp" ]]; then
+    echo -e "${GREEN}PASS${RESET}, ${NAMES[0]} (${CYAN}$HASH_NAME${RESET})"
+  else
+    echo -e "${RED}NG${RESET}, ${NAMES[0]} (${CYAN}$HASH_NAME${RESET})"
+  fi
+  exit 0
+fi
+
+# 多文件 + 对比
+if [[ ${#NAMES[@]} -gt 1 && -n "$COMPARE_VAL" ]]; then
+  cmp=$(to_lower "$COMPARE_VAL")
+  NG_FILES=()
+  for i in "${!NAMES[@]}"; do
+    val=$(to_lower "${HASHES[$i]}")
+    if [[ "$val" != "$cmp" ]]; then
+      NG_FILES+=("${NAMES[$i]}")
+    fi
+  done
+  if [[ ${#NG_FILES[@]} -eq 0 ]]; then
+    echo -e "${GREEN}PASS${RESET}, 所有文件（${CYAN}$HASH_NAME${RESET})"
+  else
+    echo -e "${RED}NG${RESET}, ${NG_FILES[*]}（${CYAN}$HASH_NAME${RESET})"
+  fi
+  exit 0
+fi
+
+# 无对比参数
+if [[ ${#NAMES[@]} -eq 1 ]]; then
+  echo -e "${CYAN}${NAMES[0]}${RESET}, ${HASH_NAME}=${GREEN}${HASHES[0]}${RESET}"
+else
+  first=$(to_lower "${HASHES[0]}")
+  all_same=1
+  for h in "${HASHES[@]}"; do
+    val=$(to_lower "$h")
+    [[ "$val" != "$first" ]] && all_same=0 && break
+  done
+  if [[ $all_same -eq 1 ]]; then
+    echo -e "${GREEN}PASS${RESET}，文件的 ${CYAN}$HASH_NAME${RESET} 值相同"
+  else
+    echo -e "${RED}NG${RESET}，文件的 ${CYAN}$HASH_NAME${RESET} 值不同"
+  fi
+fi
+
