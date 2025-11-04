@@ -1,2 +1,6 @@
+condaenv/
+.venv/
+.python-version
+.DS_store
+*.pyc
 .env
-.DS_Store
